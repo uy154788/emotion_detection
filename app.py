@@ -1,111 +1,126 @@
 from flask import Flask, request, jsonify
 import cv2
-import dlib
-from fer import FER
-import numpy as np
-import requests
+import mediapipe as mp
+from deepface import DeepFace
+from collections import defaultdict
+import os
 
 app = Flask(__name__)
 
-# Load pre-trained facial landmark detector
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor(
-    "shape_predictor_68_face_landmarks.dat")  # Ensure this file is in your working directory
+# Initialize MediaPipe Face Mesh
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=1,  # Adjust if handling multiple faces
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
-# Initialize the FER emotion detector
-emotion_detector = FER()
-
-
-@app.route('/process_video', methods=['POST'])
+@app.route('/upload', methods=['POST'])
 def process_video():
+    # Check if a video URL is provided
     data = request.json
-    print("Received data:", data)
-    video_url = data.get('video_url')
-
-    if not video_url:
-        return jsonify({"error": "No video URL provided"}), 400
-
-    # Download the video file from the provided URL
-    video_path = 'temp_video.mp4'
-    response = requests.get(video_url)
-    with open(video_path, 'wb') as f:
-        f.write(response.content)
+    video_path = data.get('video_url') if data else None
 
     # Initialize video capture
     cap = cv2.VideoCapture(video_path)
 
-    # Emotion scores accumulator
-    emotion_scores = {
-        'angry': [],
-        'disgust': [],
-        'fear': [],
-        'happy': [],
-        'sad': [],
-        'surprise': [],
-        'neutral': []
-    }
+    if not cap.isOpened():
+        return jsonify({"error": f"Error opening video file {video_path}"}), 500
 
-    frame_count = 0
-    frame_skip = 5
+    # Initialize emotion counts and confidences
+    emotion_counts = defaultdict(int)
+    emotion_confidences = defaultdict(list)
+    no_face_detected = 0
+    frame_skip = 5  # Process every 5th frame
+    frame_number = 0
 
     while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
+        success, frame = cap.read()
+        if not success:
             break
-        frame_count += 1
-        if frame_count % frame_skip != 0:
-            # Convert frame to grayscale for faster processing
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # Detect faces in the grayscale frame
-            faces = detector(gray)
+        frame_number += 1
 
-            # Loop through detected faces
-            for face in faces:
-                # Detect facial landmarks
-                landmarks = predictor(gray, face)
+        # Skip frames for faster processing
+        if frame_number % frame_skip != 0:
+            continue
 
-                # Extract face region
-                x, y, w, h = face.left(), face.top(), face.width(), face.height()
-                face_region = frame[y:y + h, x:x + w]
+        # Resize frame for faster processing
+        aspect_ratio = 320 / frame.shape[1]
+        frame = cv2.resize(frame, (320, int(frame.shape[0] * aspect_ratio)))
 
-                # Detect emotion using the FER library
-                emotions = emotion_detector.detect_emotions(face_region)
-                if emotions:
-                    # Accumulate scores for each emotion
-                    for emotion, score in emotions[0]['emotions'].items():
-                        emotion_scores[emotion].append(score)
+        # Convert frame to RGB for processing
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    # Release resources
+        # Detect faces using MediaPipe Face Mesh
+        results = face_mesh.process(image_rgb)
+
+        if results.multi_face_landmarks:
+            for face_landmarks in results.multi_face_landmarks:
+                h, w, _ = frame.shape
+                x_coords = [landmark.x for landmark in face_landmarks.landmark]
+                y_coords = [landmark.y for landmark in face_landmarks.landmark]
+                x_min, x_max = int(min(x_coords) * w), int(max(x_coords) * w)
+                y_min, y_max = int(min(y_coords) * h), int(max(y_coords) * h)
+
+                # Add padding
+                padding = 20
+                x_min, y_min = max(x_min - padding, 0), max(y_min - padding, 0)
+                x_max, y_max = min(x_max + padding, w), min(y_max + padding, h)
+
+                # Crop the face region
+                face_roi = frame[y_min:y_max, x_min:x_max]
+
+                try:
+                    # Use DeepFace to analyze the face region
+                    analysis = DeepFace.analyze(face_roi, actions=['emotion'], enforce_detection=False)
+
+                    # If multiple analyses, take the first one
+                    if isinstance(analysis, list):
+                        analysis = analysis[0]
+
+                    dominant_emotion = analysis['dominant_emotion']
+                    emotion_confidence = analysis['emotion'][dominant_emotion]
+
+                    # Update counts and confidences
+                    emotion_counts[dominant_emotion] += 1
+                    emotion_confidences[dominant_emotion].append(emotion_confidence)
+
+                except Exception as e:
+                    print(f"Error processing frame {frame_number}: {e}")
+                    continue
+        else:
+            no_face_detected += 1
+
     cap.release()
 
-    # Calculate average emotion scores
-    average_emotion_scores = {emotion: np.mean(scores) if scores else 0 for emotion, scores in emotion_scores.items()}
-    for emotion, score in average_emotion_scores.items():
-        average_emotion_scores[emotion] = round(average_emotion_scores[emotion] * frame_count)
+    # Delete the temporary video file if created
+    if os.path.exists(video_path):
+        os.remove(video_path)
 
-    # Calculate final confidence
     confidence_level = 0
-    for emotion, score in average_emotion_scores.items():
-        if emotion in ['happy']:
-            confidence_level += 1 * average_emotion_scores[emotion]
-        elif emotion in ['neutral']:
-            confidence_level += 0.8 * average_emotion_scores[emotion]
-        elif emotion in ['surprise']:
-            confidence_level += 0.6 * average_emotion_scores[emotion]
+    emotion_frame_value = 0
+    for emotion, value in emotion_counts.items():
+        emotion_frame_value += value
+        if emotion == 'happy':
+            confidence_level += 0.95 * value
+        elif emotion == 'neutral':
+            confidence_level += 0.9 * value
+        elif emotion == 'surprise':
+            confidence_level += 0.6 * value
         elif emotion in ['sad', 'fear']:
-            confidence_level += 0.4 * average_emotion_scores[emotion]
+            confidence_level += 0.5 * value
         elif emotion in ['angry', 'disgust']:
-            confidence_level += 0.1 * average_emotion_scores[emotion]
+            confidence_level += 0.3 * value
 
-    confidence_level = round((confidence_level / frame_count) * 100, 2)
 
-    # Return results
-    return jsonify({
-        "average_emotion_scores": average_emotion_scores,
-        "frame_count": frame_count,
-        "confidence_level": confidence_level
-    })
+    total_valid_frame = emotion_frame_value + no_face_detected
+    confidence = round((confidence_level / total_valid_frame) * 100, 2)
+
+    # Return the results as JSON
+    return jsonify({"average_confidence": confidence})
 
 
 if __name__ == '__main__':
