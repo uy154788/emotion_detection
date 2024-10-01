@@ -19,6 +19,7 @@ face_mesh = mp_face_mesh.FaceMesh(
 
 @app.route('/upload', methods=['POST'])
 def process_video():
+
     # Check if a video URL is provided
     data = request.json
     video_path = data.get('video_url') if data else None
