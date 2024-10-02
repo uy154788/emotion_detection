@@ -123,6 +123,9 @@ def process_video():
     # Return the results as JSON
     return jsonify({"average_confidence": confidence})
 
+@app.route('/hello',methods=['POST'])
+def hello_function():
+    return jsonify("Hello From Server")
 
 if __name__ == '__main__':
     app.run(debug=False)
