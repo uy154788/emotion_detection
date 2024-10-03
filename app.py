@@ -6,7 +6,6 @@ from collections import defaultdict
 import os
 
 app = Flask(__name__)
-
 # Initialize MediaPipe Face Mesh
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
